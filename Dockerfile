@@ -10,6 +10,18 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 # new upstream commits.
 ARG HERMES_REF=v2026.5.7
 
+# gbrain (the shared-knowledge-base CLI) is run *inside* this container as a
+# stdio MCP server so the agent can read/write the brain. `gbrain serve` is
+# stdio-only — it cannot be a separate networked service — so it must live
+# here. Pinned to an exact commit (gbrain publishes no release tags) so every
+# rebuild produces the same binary and stays schema-compatible with the
+# already-migrated Supabase brain. To bump: pick a newer commit from
+# https://github.com/garrytan/gbrain and update GBRAIN_REF.
+ARG GBRAIN_REF=e2279650249beffc1310a9f204f833fb595915ec
+# Bun is gbrain's runtime (its bin is a `#!/usr/bin/env bun` script). Pinned
+# to the version validated against the gbrain commit above.
+ARG BUN_VERSION=1.3.10
+
 # tini = tiny init that we run as PID 1. Without it, hermes's grandchild
 # processes (MCP stdio servers, git, bun, browser daemons spawned by tools)
 # reparent to PID 1 when their parents exit and pile up as zombies. After
@@ -60,6 +72,24 @@ RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/h
 #   instead of at user request time.
 # - We keep ui-tui/ entirely (node_modules + dist + src) so hermes's
 #   freshness checks don't trigger a re-install at runtime.
+
+# ── gbrain (shared-brain MCP server, run as a stdio child of the agent) ──────
+# Install pinned bun, clone gbrain at the pinned commit, install deps. We run
+# gbrain from source via bun (not a --compile binary) so its on-disk assets
+# (SQL migrations, skills) are always present at runtime. /usr/local/bin/gbrain
+# is a thin wrapper so the agent can invoke it as just `gbrain serve`.
+# The Supabase URL is NOT baked in — it is read from $GBRAIN_DATABASE_URL in
+# the container env at runtime (set by Railway from Doppler).
+ENV BUN_INSTALL=/usr/local
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" && \
+    git clone https://github.com/garrytan/gbrain.git /opt/gbrain && \
+    cd /opt/gbrain && git checkout --quiet ${GBRAIN_REF} && \
+    /usr/local/bin/bun install --frozen-lockfile && \
+    rm -rf /opt/gbrain/.git && \
+    printf '#!/bin/sh\nexec /usr/local/bin/bun run /opt/gbrain/src/cli.ts "$@"\n' \
+      > /usr/local/bin/gbrain && \
+    chmod +x /usr/local/bin/gbrain && \
+    GBRAIN_DATABASE_URL= /usr/local/bin/gbrain --version
 
 COPY requirements.txt /app/requirements.txt
 RUN uv pip install --system --no-cache -r /app/requirements.txt
