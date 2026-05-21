@@ -56,80 +56,100 @@ else:
     print("[start.sh] seeded mcp_servers.gbrain into config.yaml")
 PY
 
-# Validate LLM_MODEL against OpenRouter's actual model catalog. Recurring
-# footgun: setting LLM_MODEL to a deprecated alias (e.g. "claude-sonnet-latest"
-# or anything with a "~" prefix) makes every chat fail with HTTP 400 from
-# OpenRouter — and you don't notice until someone DMs the bot. We check once
-# at boot. If the configured model isn't in the catalog, fall back to a known-
-# good default so the bot stays *usable* rather than wedged. A different model
-# is a worse outcome than a wedged production bot only in spec-compliance, not
-# in practice — the loud log line and the brain page (org/hermes-deploy.md)
-# tell the operator what happened.
+# Validate LLM_MODEL — Pattern B (admin UI / .env is the source of truth).
+#
+# At boot we read whatever model is in /data/.hermes/.env (the admin-dashboard
+# "save & restart" flow writes to this file, and server.py:464-469 reads it
+# preferentially over process env when spawning the gateway). We validate the
+# value against OpenRouter's actual model catalog and only overwrite if it's
+# bad — gracefully falling back to SAFE_LLM_DEFAULT so the bot stays usable
+# rather than wedged on a deprecated/typo model id.
+#
+# Order of precedence for the boot-time value:
+#   1. LLM_MODEL line in /data/.hermes/.env  (the admin UI's latest choice)
+#   2. LLM_MODEL in process env              (Doppler seed, if anyone still pushes one)
+#   3. SAFE_LLM_DEFAULT                      (last-resort known-good fallback)
+#
+# To change the model day-to-day: open the admin dashboard, pick from the
+# selector, save & restart. The change persists across container restarts
+# because .env survives on the persistent volume. If you pick something
+# OpenRouter has deprecated (rare), the next container boot logs a loud
+# WARN and replaces it with SAFE_LLM_DEFAULT — bot keeps working.
 SAFE_LLM_DEFAULT="anthropic/claude-sonnet-4.6"
-VALIDATED_LLM_MODEL=$(SAFE_LLM_DEFAULT="$SAFE_LLM_DEFAULT" python3 - <<'PY'
+python3 - <<PY
 import os, json, sys, urllib.request
-model = (os.environ.get('LLM_MODEL') or '').strip()
-default = os.environ['SAFE_LLM_DEFAULT']
-key = (os.environ.get('OPENROUTER_API_KEY') or '').strip()
-def log(m): sys.stderr.write(m + "\n")
-if not model:
-    log(f"[start.sh] WARN: LLM_MODEL empty — using {default}")
-    print(default); sys.exit(0)
-if not key:
-    log(f"[start.sh] no OPENROUTER_API_KEY — skipping validation; keeping {model}")
-    print(model); sys.exit(0)
-try:
-    req = urllib.request.Request(
-        'https://openrouter.ai/api/v1/models',
-        headers={'Authorization': 'Bearer ' + key}
-    )
-    ids = {m['id'] for m in json.load(urllib.request.urlopen(req, timeout=10))['data']}
-    if model in ids:
-        log(f"[start.sh] LLM_MODEL={model} validated against OpenRouter catalog ({len(ids)} models)")
-        print(model)
-    else:
-        log(f"[start.sh] WARN: LLM_MODEL={model} NOT in OpenRouter catalog. Falling back to {default}")
-        log(f"[start.sh]       See org/hermes-deploy.md for the LLM_MODEL gotcha.")
-        print(default)
-except Exception as e:
-    log(f"[start.sh] WARN: could not validate LLM_MODEL ({e}); keeping {model} as-is")
-    print(model)
-PY
-)
-export LLM_MODEL="$VALIDATED_LLM_MODEL"
 
-# Reconcile /data/.hermes/.env so the gateway sees the validated value.
-# server.py:464-469 reads .env preferentially over process env when spawning
-# the gateway ("# .env values take priority over Railway env vars"), and
-# server.py:474 writes config.yaml's model.default from read_env(ENV_FILE)
-# only — not from os.environ. So a stale LLM_MODEL line in .env (left behind
-# by an earlier admin-dashboard form submission, or any prior bad value) will
-# shadow even a freshly-set Doppler/Railway env var indefinitely. This is
-# what kept "claude-sonnet-latest" wedging the bot across multiple redeploys
-# despite Doppler being correct. We rewrite the LLM_MODEL line idempotently;
-# every other line in .env is preserved verbatim.
-LLM_MODEL="$VALIDATED_LLM_MODEL" python3 - <<'PY'
-import os
-p = "/data/.hermes/.env"
-model = os.environ["LLM_MODEL"]
+default  = "${SAFE_LLM_DEFAULT}"
+env_path = "/data/.hermes/.env"
+key      = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+
+def log(m): sys.stderr.write(m + "\\n")
+
+# 1. Read current LLM_MODEL from .env (admin dashboard's persisted choice)
+current, source = None, None
 try:
-    lines = open(p).read().splitlines()
+    for line in open(env_path).read().splitlines():
+        if line.startswith("LLM_MODEL="):
+            current = line[len("LLM_MODEL="):].strip()
+            source  = ".env"
+            break
+except FileNotFoundError:
+    pass
+
+# 2. Fall back to process env (legacy Doppler seed)
+if not current:
+    current = (os.environ.get("LLM_MODEL") or "").strip()
+    source  = "process env (Doppler seed)" if current else None
+
+# 3. Last resort: hard-coded safe default
+if not current:
+    current = default
+    source  = "SAFE_LLM_DEFAULT"
+
+# 4. Validate against OpenRouter (skip cleanly if unreachable)
+final = current
+if not key:
+    log(f"[start.sh] no OPENROUTER_API_KEY — skipping validation; keeping {current} (source: {source})")
+else:
+    try:
+        req = urllib.request.Request("https://openrouter.ai/api/v1/models",
+                                     headers={"Authorization": "Bearer " + key})
+        ids = {m["id"] for m in json.load(urllib.request.urlopen(req, timeout=10))["data"]}
+        if current in ids:
+            log(f"[start.sh] LLM_MODEL={current} validated against OpenRouter catalog ({len(ids)} models) [source: {source}]")
+        else:
+            log(f"[start.sh] WARN: LLM_MODEL={current} NOT in OpenRouter catalog (source: {source}). Falling back to {default}.")
+            log(f"[start.sh]       Change model via the Hermes admin dashboard. See org/hermes-deploy.md.")
+            final = default
+    except Exception as e:
+        log(f"[start.sh] WARN: could not reach OpenRouter to validate ({e}); keeping {current} (source: {source})")
+
+# 5. Ensure .env has the final value (idempotent; preserves every other line)
+try:
+    lines = open(env_path).read().splitlines()
 except FileNotFoundError:
     lines = []
 out, found = [], False
 for line in lines:
     if line.startswith("LLM_MODEL="):
         if not found:
-            out.append(f"LLM_MODEL={model}"); found = True
-        # drop any duplicate LLM_MODEL lines (defensive)
+            out.append(f"LLM_MODEL={final}"); found = True
     else:
         out.append(line)
 if not found:
-    out.append(f"LLM_MODEL={model}")
-with open(p, "w") as f:
-    f.write("\n".join(out) + ("\n" if out else ""))
-os.chmod(p, 0o600)
-print(f"[start.sh] /data/.hermes/.env LLM_MODEL reconciled to {model}")
+    out.append(f"LLM_MODEL={final}")
+new_content = "\\n".join(out) + ("\\n" if out else "")
+try:
+    if open(env_path).read() == new_content:
+        log(f"[start.sh] /data/.hermes/.env LLM_MODEL already {final}; no write needed")
+    else:
+        with open(env_path, "w") as f: f.write(new_content)
+        os.chmod(env_path, 0o600)
+        log(f"[start.sh] /data/.hermes/.env LLM_MODEL set to {final}")
+except FileNotFoundError:
+    with open(env_path, "w") as f: f.write(new_content)
+    os.chmod(env_path, 0o600)
+    log(f"[start.sh] /data/.hermes/.env created with LLM_MODEL={final}")
 PY
 
 # Clear any stale gateway PID file left over from the previous container.
