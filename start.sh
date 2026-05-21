@@ -98,6 +98,40 @@ PY
 )
 export LLM_MODEL="$VALIDATED_LLM_MODEL"
 
+# Reconcile /data/.hermes/.env so the gateway sees the validated value.
+# server.py:464-469 reads .env preferentially over process env when spawning
+# the gateway ("# .env values take priority over Railway env vars"), and
+# server.py:474 writes config.yaml's model.default from read_env(ENV_FILE)
+# only — not from os.environ. So a stale LLM_MODEL line in .env (left behind
+# by an earlier admin-dashboard form submission, or any prior bad value) will
+# shadow even a freshly-set Doppler/Railway env var indefinitely. This is
+# what kept "claude-sonnet-latest" wedging the bot across multiple redeploys
+# despite Doppler being correct. We rewrite the LLM_MODEL line idempotently;
+# every other line in .env is preserved verbatim.
+LLM_MODEL="$VALIDATED_LLM_MODEL" python3 - <<'PY'
+import os
+p = "/data/.hermes/.env"
+model = os.environ["LLM_MODEL"]
+try:
+    lines = open(p).read().splitlines()
+except FileNotFoundError:
+    lines = []
+out, found = [], False
+for line in lines:
+    if line.startswith("LLM_MODEL="):
+        if not found:
+            out.append(f"LLM_MODEL={model}"); found = True
+        # drop any duplicate LLM_MODEL lines (defensive)
+    else:
+        out.append(line)
+if not found:
+    out.append(f"LLM_MODEL={model}")
+with open(p, "w") as f:
+    f.write("\n".join(out) + ("\n" if out else ""))
+os.chmod(p, 0o600)
+print(f"[start.sh] /data/.hermes/.env LLM_MODEL reconciled to {model}")
+PY
+
 # Clear any stale gateway PID file left over from the previous container.
 # `hermes gateway` writes /data/.hermes/gateway.pid on start but does not
 # remove it on SIGTERM. Since /data is a persistent volume, the file
