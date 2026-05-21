@@ -56,6 +56,48 @@ else:
     print("[start.sh] seeded mcp_servers.gbrain into config.yaml")
 PY
 
+# Validate LLM_MODEL against OpenRouter's actual model catalog. Recurring
+# footgun: setting LLM_MODEL to a deprecated alias (e.g. "claude-sonnet-latest"
+# or anything with a "~" prefix) makes every chat fail with HTTP 400 from
+# OpenRouter — and you don't notice until someone DMs the bot. We check once
+# at boot. If the configured model isn't in the catalog, fall back to a known-
+# good default so the bot stays *usable* rather than wedged. A different model
+# is a worse outcome than a wedged production bot only in spec-compliance, not
+# in practice — the loud log line and the brain page (org/hermes-deploy.md)
+# tell the operator what happened.
+SAFE_LLM_DEFAULT="anthropic/claude-sonnet-4.6"
+VALIDATED_LLM_MODEL=$(SAFE_LLM_DEFAULT="$SAFE_LLM_DEFAULT" python3 - <<'PY'
+import os, json, sys, urllib.request
+model = (os.environ.get('LLM_MODEL') or '').strip()
+default = os.environ['SAFE_LLM_DEFAULT']
+key = (os.environ.get('OPENROUTER_API_KEY') or '').strip()
+def log(m): sys.stderr.write(m + "\n")
+if not model:
+    log(f"[start.sh] WARN: LLM_MODEL empty — using {default}")
+    print(default); sys.exit(0)
+if not key:
+    log(f"[start.sh] no OPENROUTER_API_KEY — skipping validation; keeping {model}")
+    print(model); sys.exit(0)
+try:
+    req = urllib.request.Request(
+        'https://openrouter.ai/api/v1/models',
+        headers={'Authorization': 'Bearer ' + key}
+    )
+    ids = {m['id'] for m in json.load(urllib.request.urlopen(req, timeout=10))['data']}
+    if model in ids:
+        log(f"[start.sh] LLM_MODEL={model} validated against OpenRouter catalog ({len(ids)} models)")
+        print(model)
+    else:
+        log(f"[start.sh] WARN: LLM_MODEL={model} NOT in OpenRouter catalog. Falling back to {default}")
+        log(f"[start.sh]       See org/hermes-deploy.md for the LLM_MODEL gotcha.")
+        print(default)
+except Exception as e:
+    log(f"[start.sh] WARN: could not validate LLM_MODEL ({e}); keeping {model} as-is")
+    print(model)
+PY
+)
+export LLM_MODEL="$VALIDATED_LLM_MODEL"
+
 # Clear any stale gateway PID file left over from the previous container.
 # `hermes gateway` writes /data/.hermes/gateway.pid on start but does not
 # remove it on SIGTERM. Since /data is a persistent volume, the file
