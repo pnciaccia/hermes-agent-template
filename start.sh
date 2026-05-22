@@ -16,12 +16,16 @@ fi
 
 [ ! -f /data/.hermes/.env ] && touch /data/.hermes/.env
 
-# Ensure the agent knows about the gbrain shared-brain MCP server. Idempotent:
-# only adds the entry if absent, so manual edits (renaming, disabling, a
-# co-founder's tweaks) survive every redeploy. The DB URL is written as the
-# literal "${GBRAIN_DATABASE_URL}" placeholder — hermes expands it from the
-# container env at config load, so the Supabase secret is never written to the
-# /data volume in plaintext.
+# Ensure the agent knows about the gbrain shared-brain MCP server, AND that
+# its required env keys are present on every boot. First-run: seed the full
+# entry. Subsequent boots: reconcile the REQUIRED keys (don't blow away
+# manual additions). The required-key reconciliation matters because new
+# required env vars (e.g., GBRAIN_SOURCE added 2026-05-22 to prevent
+# silent-source-fallback to the empty `default` source) otherwise never
+# propagate to a /data volume that already has a seeded config.yaml.
+# DB URLs / source / API key are written as literal "${VAR}" placeholders —
+# hermes expands them from the container env at config load, so secrets are
+# never written to the /data volume in plaintext.
 python - <<'PY' || true
 import sys
 try:
@@ -37,23 +41,43 @@ except FileNotFoundError:
 if not isinstance(cfg, dict):
     cfg = {}
 servers = cfg.setdefault("mcp_servers", {})
+
+REQUIRED_ENV = {
+    "GBRAIN_DATABASE_URL":        "${GBRAIN_DATABASE_URL}",
+    "GBRAIN_DIRECT_DATABASE_URL": "${GBRAIN_DIRECT_DATABASE_URL}",
+    "GBRAIN_SOURCE":              "${GBRAIN_SOURCE}",
+    "OPENAI_API_KEY":             "${OPENAI_API_KEY}",
+}
+
 if not isinstance(servers, dict):
     print("[start.sh] mcp_servers is not a mapping; leaving config untouched")
-elif "gbrain" in servers:
-    print("[start.sh] mcp_servers.gbrain already present; leaving as-is")
 else:
-    servers["gbrain"] = {
-        "command": "gbrain",
-        "args": ["serve"],
-        "env": {
-            "GBRAIN_DATABASE_URL": "${GBRAIN_DATABASE_URL}",
-            "GBRAIN_DIRECT_DATABASE_URL": "${GBRAIN_DIRECT_DATABASE_URL}",
-            "OPENAI_API_KEY": "${OPENAI_API_KEY}",
-        },
-    }
-    with open(p, "w") as f:
-        yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
-    print("[start.sh] seeded mcp_servers.gbrain into config.yaml")
+    existing = servers.get("gbrain")
+    if not isinstance(existing, dict):
+        servers["gbrain"] = {
+            "command": "gbrain",
+            "args": ["serve"],
+            "env": dict(REQUIRED_ENV),
+        }
+        with open(p, "w") as f:
+            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+        print("[start.sh] seeded mcp_servers.gbrain into config.yaml")
+    else:
+        env = existing.setdefault("env", {})
+        if not isinstance(env, dict):
+            env = {}
+            existing["env"] = env
+        changed = []
+        for k, v in REQUIRED_ENV.items():
+            if env.get(k) != v:
+                env[k] = v
+                changed.append(k)
+        if changed:
+            with open(p, "w") as f:
+                yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+            print(f"[start.sh] reconciled mcp_servers.gbrain.env: {','.join(changed)}")
+        else:
+            print("[start.sh] mcp_servers.gbrain.env already in sync")
 PY
 
 # Validate LLM_MODEL — Pattern B (admin UI / .env is the source of truth).
